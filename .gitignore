@@ -1,0 +1,6 @@
+# Bland secrets live in ~/.config/bland/ (outside the repo); guard against copies.
+credentials.json
+onboarding.json
+.env
+*.key
+__pycache__/
