@@ -5,18 +5,27 @@ Implements the device-authorization flow from
 https://docs.bland.ai/platform/connect-your-agent and thin REST wrappers for
 SMS and calls. Standard library only.
 
+Where the API key comes from (first match wins):
+  1. ~/.config/bland/credentials.json, written by `poll` after onboarding
+     (override the directory with BLAND_CONFIG_DIR).
+  2. The BLAND_API_KEY environment variable.
+  3. A network secret saved on the cloud environment for api.bland.ai. The
+     environment's proxy overwrites the Authorization header on every request,
+     so the script sends a placeholder and never holds the real key.
+
 Secret handling:
-  * The API key and the device_code are written only to 0600 files under
-    ~/.config/bland/ (override with BLAND_CONFIG_DIR), never to stdout/stderr.
+  * The API key and the device_code are written only to 0600 files, never to
+    stdout/stderr.
   * Every line this script prints passes through redact(), which replaces any
     known secret with [REDACTED] as a second line of defence.
 
 Commands:
   start  [--client-name NAME] [--base-url URL]  begin onboarding, print link + code
   poll                                         poll at the server's interval until done
-  status                                       show saved, non-secret connection info
-  whoami                                       verify the saved key against GET /v1/me
-  sms    --to +1XXXXXXXXXX --message TEXT [--objective TEXT]
+  status                                       key source, number, and a live auth check
+  whoami                                       verify the key against GET /v1/me
+  sms    --to +1XXXXXXXXXX --message TEXT [--objective TEXT] [--no-wait]
+  sms-status --conversation ID [--message-id ID]
   call   --to +1XXXXXXXXXX --task TEXT
 """
 
@@ -29,7 +38,13 @@ import urllib.error
 import urllib.request
 import uuid
 
-DEFAULT_BASE_URL = "https://api.bland.ai"
+DEFAULT_BASE_URL = os.environ.get("BLAND_BASE_URL", "https://api.bland.ai")
+PROXY_PLACEHOLDER = "proxy-injected"
+TERMINAL_SMS_STATUSES = {"delivered", "read", "failed", "undelivered"}
+SMS_ERROR_HINTS = {
+    "30034": "US A2P 10DLC: the sending number is not linked to an approved A2P campaign. "
+             "Check `messaging_service_sid` with `status`; Bland support must link it.",
+}
 CONFIG_DIR = os.path.expanduser(os.environ.get("BLAND_CONFIG_DIR", "~/.config/bland"))
 CRED_PATH = os.path.join(CONFIG_DIR, "credentials.json")
 STATE_PATH = os.path.join(CONFIG_DIR, "onboarding.json")
@@ -66,11 +81,62 @@ def read_json(path):
 
 
 def load_creds():
-    if not os.path.exists(CRED_PATH):
-        sys.exit(f"No saved Bland credentials at {CRED_PATH}. Run: bland.py start && bland.py poll")
-    creds = read_json(CRED_PATH)
-    _SECRETS.add(creds.get("api_key"))
+    """Onboarding file > BLAND_API_KEY > proxy-injected network secret."""
+    if os.path.exists(CRED_PATH):
+        creds = read_json(CRED_PATH)
+        creds["source"] = f"file {CRED_PATH}"
+    elif os.environ.get("BLAND_API_KEY"):
+        creds = {"api_key": os.environ["BLAND_API_KEY"], "source": "env BLAND_API_KEY"}
+    else:
+        creds = {"api_key": PROXY_PLACEHOLDER, "source": "environment network secret (proxy-injected)"}
+    if not creds.get("base_url"):
+        creds["base_url"] = DEFAULT_BASE_URL
+    if creds["api_key"] != PROXY_PLACEHOLDER:
+        _SECRETS.add(creds["api_key"])
     return creds
+
+
+def auth(c):
+    return {"authorization": c["api_key"]}
+
+
+def sms_numbers(c):
+    status, payload, _ = request("GET", f"{c['base_url']}/v1/sms/numbers", headers=auth(c))
+    if status != 200 or not isinstance(payload, dict):
+        return status, []
+    return status, payload.get("data") or []
+
+
+def agent_number(c):
+    """The saved number, or the account's first SMS number from Bland."""
+    if c.get("phone_number"):
+        return c["phone_number"]
+    status, nums = sms_numbers(c)
+    if status == 401:
+        sys.exit("Bland rejected the key (HTTP 401). Run onboarding, set BLAND_API_KEY, "
+                 "or save a network secret for api.bland.ai.")
+    if not nums:
+        sys.exit("No SMS number on this account. Texting requires the Agent Phone Plan.")
+    return nums[0]["phone_number"]
+
+
+def check_delivery(c, conversation_id, message_id=None, wait_s=60):
+    """Poll the conversation until the message reaches a terminal status. Returns the status."""
+    deadline = time.time() + wait_s
+    st = None
+    while True:
+        status, payload, _ = request("GET", f"{c['base_url']}/v1/sms/conversations/{conversation_id}",
+                                     headers=auth(c))
+        msgs = ((payload.get("data") or {}).get("messages") or []) if isinstance(payload, dict) else []
+        agent_msgs = [m for m in msgs if m.get("sender") == "AGENT"]
+        m = next((x for x in msgs if x.get("id") == message_id), None) or (agent_msgs or [{}])[-1]
+        st, code = m.get("status"), m.get("error_code")
+        out(f"delivery: HTTP {status} message {m.get('id')} status={st} error_code={code}")
+        if code and str(code) in SMS_ERROR_HINTS:
+            out("hint:", SMS_ERROR_HINTS[str(code)])
+        if st in TERMINAL_SMS_STATUSES or time.time() >= deadline:
+            return st
+        time.sleep(5)
 
 
 def request(method, url, body=None, headers=None):
@@ -190,17 +256,25 @@ def cmd_poll(_args):
 
 def cmd_status(_args):
     c = load_creds()
+    out("key source:", c["source"])
+    if os.path.exists(CRED_PATH):
+        out("credentials file mode:", oct(os.stat(CRED_PATH).st_mode & 0o777))
+    out("base_url:", c["base_url"])
+    status, _, _ = request("GET", f"{c['base_url']}/v1/me", headers=auth(c))
+    out("auth check GET /v1/me -> HTTP", status)
+    nstatus, nums = sms_numbers(c)
+    out("GET /v1/sms/numbers -> HTTP", nstatus)
+    for n in nums:
+        sid = (n.get("sms_config") or {}).get("messaging_service_sid") or n.get("messaging_service")
+        out("number:", n.get("phone_number"), "| A2P messaging_service_sid present:", bool(sid))
     plan = c.get("plan") or {}
-    out("credentials file:", CRED_PATH, oct(os.stat(CRED_PATH).st_mode & 0o777))
-    out("api_key present:", bool(c.get("api_key")))
-    out("base_url:", c.get("base_url"))
-    out("phone_number:", c.get("phone_number"))
-    out("plan:", plan.get("display_name"), "| status:", plan.get("status"))
+    if plan:
+        out("plan (from onboarding):", plan.get("display_name"), "| status:", plan.get("status"))
 
 
 def cmd_whoami(_args):
     c = load_creds()
-    status, payload, _ = request("GET", f"{c['base_url']}/v1/me", headers={"authorization": c["api_key"]})
+    status, payload, _ = request("GET", f"{c['base_url']}/v1/me", headers=auth(c))
     out("GET /v1/me -> HTTP", status)
     if isinstance(payload, dict):
         out("account status:", payload.get("status"))
@@ -212,24 +286,34 @@ def cmd_whoami(_args):
 
 def cmd_sms(args):
     c = load_creds()
-    if not c.get("phone_number"):
-        sys.exit("No dedicated number saved. Texting requires the Agent Phone Plan.")
-    body = {"user_number": args.to, "agent_number": c["phone_number"], "agent_message": args.message}
+    body = {"user_number": args.to, "agent_number": agent_number(c), "agent_message": args.message}
     if args.objective:
         body["objective"] = args.objective
     status, payload, _ = request("POST", f"{c['base_url']}/v1/sms/send", body,
-                                 headers={"authorization": c["api_key"],
+                                 headers={**auth(c),
                                           "idempotency-key": args.idempotency_key or str(uuid.uuid4())})
     out("POST /v1/sms/send -> HTTP", status)
     out(json.dumps(payload)[:800])
-    sys.exit(0 if status == 200 and not first_error(payload) else 1)
+    if status != 200 or first_error(payload):
+        sys.exit(1)
+    d = payload.get("data") or {}
+    if args.no_wait or not d.get("conversation_id"):
+        return
+    # HTTP 200 only means "accepted"; the carrier result arrives later.
+    st = check_delivery(c, d["conversation_id"], d.get("message_id"))
+    sys.exit(0 if st in ("delivered", "read") else 1)
+
+
+def cmd_sms_status(args):
+    c = load_creds()
+    st = check_delivery(c, args.conversation, args.message_id, wait_s=0)
+    sys.exit(0 if st in ("delivered", "read") else 1)
 
 
 def cmd_call(args):
     c = load_creds()
     body = {"phone_number": args.to, "task": args.task}
-    status, payload, _ = request("POST", f"{c['base_url']}/v1/calls", body,
-                                 headers={"authorization": c["api_key"]})
+    status, payload, _ = request("POST", f"{c['base_url']}/v1/calls", body, headers=auth(c))
     out("POST /v1/calls -> HTTP", status)
     out(json.dumps(payload)[:800])
     sys.exit(0 if status == 200 and not first_error(payload) else 1)
@@ -251,7 +335,12 @@ def main():
     m.add_argument("--message", required=True)
     m.add_argument("--objective")
     m.add_argument("--idempotency-key")
+    m.add_argument("--no-wait", action="store_true", help="skip the delivery-status check")
     m.set_defaults(fn=cmd_sms)
+    q = sub.add_parser("sms-status")
+    q.add_argument("--conversation", required=True)
+    q.add_argument("--message-id")
+    q.set_defaults(fn=cmd_sms_status)
     k = sub.add_parser("call")
     k.add_argument("--to", required=True)
     k.add_argument("--task", required=True)
